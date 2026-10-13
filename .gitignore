@@ -1,0 +1,6 @@
+# 비밀값·개인 파일은 깃허브에 올리지 않는다
+.env
+*.env
+secrets*.json
+__pycache__/
+yt_bot.log

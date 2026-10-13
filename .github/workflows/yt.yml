@@ -1,0 +1,50 @@
+name: 유튜브 요약 한 통
+
+on:
+  schedule:
+    # 매일 한국 시간 아침 7시 47분 (깃허브 시계는 한국보다 9시간 느림 → 전날 22:47로 적는다)
+    # 정각(00분)·30분은 깃허브가 붐벼 늦거나 빠질 수 있어 피했다. 깃허브가 바쁘면 늦게 돌 수 있다.
+    - cron: '47 22 * * *'
+  workflow_dispatch:   # Actions 화면의 "Run workflow" 버튼
+    inputs:
+      mode:
+        description: 'check = 자막이 되는지만 보기(돈 0원, 안 보냄) / send = 진짜 보내기(자막 있으면 AI 1회 = 돈)'
+        type: choice
+        options: [check, send]
+        default: check
+
+permissions:
+  contents: write      # 보낸 영상 목록(yt_sent.json)을 저장소에 다시 저장하기 위해 필요(이 저장소 안에서만)
+
+concurrency:
+  group: yt-summary
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8   # 8분 넘으면 강제로 끈다(깃허브 사용 시간 낭비 방지)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements_yt.txt
+      - name: 점검만 (자막이 되는지 보기, AI·발송 없음)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'check'
+        run: python yt_bot.py --check
+      - name: 새 영상 찾기 → 자막 → 요약 → 텔레그램
+        if: github.event_name == 'schedule' || inputs.mode == 'send'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python yt_bot.py
+      # 보낸 영상 번호를 저장해 다음 날 같은 영상을 또 보내지 않는다(발송 성공했을 때만 이 단계까지 온다)
+      - name: 보낸 영상 목록 저장
+        if: github.event_name == 'schedule' || inputs.mode == 'send'
+        run: |
+          git config user.name "yt-summary-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add yt_sent.json
+          git diff --cached --quiet || (git commit -m "보낸 영상 목록 저장" && git push)

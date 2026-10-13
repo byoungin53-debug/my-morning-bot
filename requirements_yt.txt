@@ -1,0 +1,2 @@
+anthropic==1.11.0
+youtube-transcript-api==1.2.4

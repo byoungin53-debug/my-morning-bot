@@ -234,55 +234,109 @@ def remove_title_line(text):
     return "\n".join(lines).strip()
 
 
+def join_bullets(text):
+    """AI가 "•" 를 혼자 한 줄에 쓰고 내용을 다음 줄에 쓰면 → "• 내용" 한 줄로 합친다."""
+    out, pending = [], None
+    for ln in text.splitlines():
+        if ln.strip() in ("•", "-", "·", "*"):
+            pending = "•"
+            continue
+        if pending and ln.strip():
+            ln = pending + " " + ln.strip()
+            pending = None
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
 def short(s, n=30):
     return s if len(s) <= n else s[:n].rstrip() + "…"
 
 
-def build_messages(summary, arts, now_kst=None):
-    """요약 + 맨 아래 '출처'(본문에 쓰인 번호만, 제목 — 주소)를 만든다.
-    4096자 안이면 한 통. 넘치면 줄 단위로 나눈다(문장·주소 중간을 자르지 않는다)."""
-    now_kst = now_kst or dt.datetime.now(KST)
-    head = "{}/{}({}) 아침 경제 뉴스".format(now_kst.month, now_kst.day, WEEK[now_kst.weekday()])
-    body = remove_title_line(remove_markdown(remove_banned(summary)))
-    used = sorted({int(n) for n in re.findall(r"\[(\d{1,3})\]", body) if 1 <= int(n) <= len(arts)})
-    refs = ""
-    if SHOW_LINKS and used:
-        refs = "\n\n출처\n" + "\n".join(
-            "[{}] {} — {}".format(n, short(arts[n - 1]["title"]), arts[n - 1]["link"]) for n in used)
-    full = head + "\n\n" + body + refs
-    if tg_len(full) <= TELEGRAM_LIMIT:
-        return [full]
-    parts, cur = [], ""
-    for ln in full.splitlines():
-        while tg_len(ln) > TELEGRAM_LIMIT:            # 한 줄이 4096자를 넘는 극단적인 경우만 강제로 나눔
-            if cur:
-                parts.append(cur)
-                cur = ""
-            parts.append(ln[:TELEGRAM_LIMIT // 2])
-            ln = ln[TELEGRAM_LIMIT // 2:]
-        cand = (cur + "\n" + ln) if cur else ln
-        if tg_len(cand) > TELEGRAM_LIMIT:
-            parts.append(cur)
-            cur = ln
+def visible_len(html_text):
+    """텔레그램이 HTML 을 해석한 뒤 화면에 보이는 글자 수(태그 빼고, &amp; 같은 표기는 1글자)."""
+    return tg_len(html.unescape(re.sub(r"<[^>]+>", "", html_text)))
+
+
+def _pack(lines, length, limit=TELEGRAM_LIMIT):
+    """줄 목록을 한 통 limit 글자 안으로 묶는다. 줄 중간(태그 중간)은 자르지 않는다."""
+    parts, cur = [], []
+    for ln in lines:
+        cand = cur + [ln]
+        if cur and length("\n".join(cand)) > limit:
+            parts.append("\n".join(cur))
+            cur = [ln]
         else:
             cur = cand
     if cur:
-        parts.append(cur)
+        parts.append("\n".join(cur))
     return parts
 
 
-def send_telegram(token, chat_id, text):
-    data = json.dumps({"chat_id": chat_id, "text": text,
-                       "link_preview_options": {"is_disabled": True}}).encode("utf-8")
+def _split_long(line, limit=TELEGRAM_LIMIT // 2):
+    """한 줄이 너무 긴 극단적인 경우만 글자 단위로 나눈다(본문 줄에만 쓰임, 태그 없음)."""
+    return [line[i:i + limit] for i in range(0, len(line), limit)] or [""]
+
+
+def build_messages(summary, arts, now_kst=None):
+    """보낼 메시지 목록을 만든다. 각 메시지 = {"html": HTML 글, "plain": [HTML 이 안 될 때 보낼 일반 글들]}.
+    - 제목은 코드가 한 번만 붙인다.
+    - 맨 아래 '출처' = 본문에 쓰인 번호만, 제목을 누르면 기사가 열리는 링크(주소 글자는 안 보임).
+    - 화면 글자 수 4096 안이면 한 통. 넘치면 줄 단위로 나눈다."""
+    now_kst = now_kst or dt.datetime.now(KST)
+    head = "{}/{}({}) 아침 경제 뉴스".format(now_kst.month, now_kst.day, WEEK[now_kst.weekday()])
+    body = join_bullets(remove_title_line(remove_markdown(remove_banned(summary))))
+    used = sorted({int(n) for n in re.findall(r"\[(\d{1,3})\]", body) if 1 <= int(n) <= len(arts)})
+
+    # (html 줄, 일반 줄) 짝
+    rows = [(html.escape(head, quote=False), head), ("", "")]
+    for ln in body.splitlines():
+        for piece in (_split_long(ln) if tg_len(ln) > TELEGRAM_LIMIT // 2 else [ln]):
+            rows.append((html.escape(piece, quote=False), piece))
+    if SHOW_LINKS and used:
+        rows += [("", ""), ("출처", "출처")]
+        for n in used:
+            a = arts[n - 1]
+            label = "[{}] {}".format(n, short(a["title"]))
+            rows.append(('<a href="{}">{}</a>'.format(html.escape(a["link"], quote=True), html.escape(label, quote=False)),
+                         "{} — {}".format(label, a["link"])))
+
+    html_parts = _pack([h for h, _ in rows], visible_len)
+    msgs, i = [], 0
+    for hp in html_parts:                 # 같은 줄 묶음으로 일반 글도 만든다(HTML 실패 대비)
+        n_lines = len(hp.split("\n"))
+        plain_lines = [p for _, p in rows[i:i + n_lines]]
+        i += n_lines
+        if hp.strip():                    # 빈 줄만 남은 조각은 보내지 않는다
+            msgs.append({"html": hp.strip("\n"),
+                         "plain": [p.strip("\n") for p in _pack(plain_lines, tg_len) if p.strip()]})
+    return msgs
+
+
+def _post(token, payload):
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request("https://api.telegram.org/bot{}/sendMessage".format(token),
                                  data=data, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            res = json.loads(r.read().decode("utf-8"))
+            return 200, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        sys.exit("멈춤: 텔레그램 발송 실패 {} — {}".format(e.code, e.read().decode("utf-8", "ignore")[:200]))
-    if not res.get("ok"):
-        sys.exit("멈춤: 텔레그램 발송 실패 — {}".format(str(res)[:200]))
+        return e.code, e.read().decode("utf-8", "ignore")
+
+
+def send_telegram(token, chat_id, msg):
+    """HTML 로 보낸다. 텔레그램이 HTML 을 못 읽으면(400 can't parse entities) 같은 내용을 일반 글로 한 번 더."""
+    base = {"chat_id": chat_id, "link_preview_options": {"is_disabled": True}}  # 링크 미리보기 끔
+    code, res = _post(token, dict(base, text=msg["html"], parse_mode="HTML"))
+    if code == 200 and isinstance(res, dict) and res.get("ok"):
+        return
+    if code == 400 and "parse entities" in str(res):
+        print("HTML 해석 실패 → 일반 글로 다시 보냄:", str(res)[:150])
+        for p in msg["plain"]:
+            code2, res2 = _post(token, dict(base, text=p))
+            if not (code2 == 200 and isinstance(res2, dict) and res2.get("ok")):
+                sys.exit("멈춤: 텔레그램 발송 실패 {} — {}".format(code2, str(res2)[:200]))
+        return
+    sys.exit("멈춤: 텔레그램 발송 실패 {} — {}".format(code, str(res)[:200]))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -305,7 +359,7 @@ def main():
     msgs = build_messages(summary, arts)
     for m in msgs:
         send_telegram(token, chat_id, m)
-    print("발송 완료: {}통, 글자 수 {}".format(len(msgs), [tg_len(m) for m in msgs]))
+    print("발송 완료: {}통, 화면 글자 수 {}".format(len(msgs), [visible_len(m["html"]) for m in msgs]))
 
 
 if __name__ == "__main__":

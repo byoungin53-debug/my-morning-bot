@@ -219,20 +219,37 @@ def remove_banned(text):
     return "\n".join(kept).strip()
 
 
+def remove_markdown(text):
+    """텔레그램은 일반 글로 보내므로 **굵게**·__밑줄__·# 제목 기호가 그대로 보인다 → 기호만 지운다."""
+    text = text.replace("**", "").replace("__", "")
+    return re.sub(r"(?m)^\s*#{1,6}\s*", "", text)
+
+
+def remove_title_line(text):
+    """AI가 첫 줄에 제목(날짜나 '아침 경제 뉴스')을 또 쓰면 지운다 — 제목은 코드가 한 번만 붙인다."""
+    lines = text.strip().splitlines()
+    if lines and (re.search(r"\d{1,2}\s*/\s*\d{1,2}", lines[0]) or "아침 경제 뉴스" in lines[0]):
+        print("AI가 쓴 제목 줄 지움:", lines[0][:40])
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+def short(s, n=30):
+    return s if len(s) <= n else s[:n].rstrip() + "…"
+
+
 def build_messages(summary, arts, now_kst=None):
-    """요약 + (인용된 기사 주소)를 텔레그램 4096자 안에 맞춘 메시지 목록으로 만든다.
-    1순위: 한 통. 넘치면 주소를 빼고, 그래도 넘치면 줄 단위로 나눈다(문장 중간을 자르지 않는다)."""
+    """요약 + 맨 아래 '출처'(본문에 쓰인 번호만, 제목 — 주소)를 만든다.
+    4096자 안이면 한 통. 넘치면 줄 단위로 나눈다(문장·주소 중간을 자르지 않는다)."""
     now_kst = now_kst or dt.datetime.now(KST)
     head = "{}/{}({}) 아침 경제 뉴스".format(now_kst.month, now_kst.day, WEEK[now_kst.weekday()])
-    body = remove_banned(summary)
+    body = remove_title_line(remove_markdown(remove_banned(summary)))
     used = sorted({int(n) for n in re.findall(r"\[(\d{1,3})\]", body) if 1 <= int(n) <= len(arts)})
     refs = ""
     if SHOW_LINKS and used:
-        refs = "\n\n" + "\n".join("[{}] {} {}".format(n, arts[n - 1]["source"], arts[n - 1]["link"]) for n in used)
+        refs = "\n\n출처\n" + "\n".join(
+            "[{}] {} — {}".format(n, short(arts[n - 1]["title"]), arts[n - 1]["link"]) for n in used)
     full = head + "\n\n" + body + refs
-    if tg_len(full) <= TELEGRAM_LIMIT:
-        return [full]
-    full = head + "\n\n" + body                       # 주소 빼기
     if tg_len(full) <= TELEGRAM_LIMIT:
         return [full]
     parts, cur = [], ""
